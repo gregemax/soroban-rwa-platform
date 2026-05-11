@@ -1,19 +1,17 @@
 #![no_std]
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env};
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
 pub enum DataKey {
     Admin,
-    FeeRate,          // basis points (e.g. 100 = 1%)
+    FeeRate, // basis points (e.g. 100 = 1%)
     Offering(u64),
     OfferingCount,
-    Holding(u64, Address),          // (asset_id, holder)
-    DividendRound(u64),             // asset_id -> current round
-    DividendInfo(u64, u32),         // (asset_id, round) -> DividendRound
+    Holding(u64, Address),            // (asset_id, holder)
+    DividendRound(u64),               // asset_id -> current round
+    DividendInfo(u64, u32),           // (asset_id, round) -> DividendRound
     DividendClaim(u64, u32, Address), // (asset_id, round, holder) -> bool
 }
 
@@ -63,7 +61,9 @@ impl Fractional {
             panic!("already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::FeeRate, &fee_rate_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeRate, &fee_rate_bps);
         env.storage().instance().set(&DataKey::OfferingCount, &0u64);
     }
 
@@ -109,12 +109,7 @@ impl Fractional {
     }
 
     /// Purchase shares from an active offering.
-    pub fn purchase_shares(
-        env: Env,
-        buyer: Address,
-        offering_id: u64,
-        shares: i128,
-    ) {
+    pub fn purchase_shares(env: Env, buyer: Address, offering_id: u64, shares: i128) {
         buyer.require_auth();
         let mut offering = Self::load_offering(&env, offering_id);
         assert!(offering.status == OfferingStatus::Active, "not active");
@@ -123,22 +118,14 @@ impl Fractional {
         assert!(shares <= available, "insufficient shares");
 
         let cost = shares * offering.price_per_share;
-        let fee_rate: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeRate)
-            .unwrap_or(0);
+        let fee_rate: u32 = env.storage().instance().get(&DataKey::FeeRate).unwrap_or(0);
         let fee = cost * fee_rate as i128 / 10_000;
         let seller_amount = cost - fee;
 
         let tok = token::Client::new(&env, &offering.token);
         tok.transfer(&buyer, &offering.owner, &seller_amount);
         if fee > 0 {
-            let admin: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::Admin)
-                .unwrap();
+            let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
             tok.transfer(&buyer, &admin, &fee);
         }
 
@@ -174,13 +161,7 @@ impl Fractional {
     }
 
     /// Transfer shares between holders.
-    pub fn transfer_shares(
-        env: Env,
-        from: Address,
-        to: Address,
-        asset_id: u64,
-        shares: i128,
-    ) {
+    pub fn transfer_shares(env: Env, from: Address, to: Address, asset_id: u64, shares: i128) {
         from.require_auth();
         let from_holding: i128 = env
             .storage()
@@ -237,8 +218,10 @@ impl Fractional {
         env.storage()
             .persistent()
             .set(&DataKey::DividendRound(asset_id), &(round + 1));
-        env.events()
-            .publish((symbol_short!("dividend"),), (asset_id, round, total_amount));
+        env.events().publish(
+            (symbol_short!("dividend"),),
+            (asset_id, round, total_amount),
+        );
         round
     }
 
@@ -272,8 +255,10 @@ impl Fractional {
         );
         let tok = token::Client::new(&env, &info.token);
         tok.transfer(&env.current_contract_address(), &holder, &payout);
-        env.events()
-            .publish((symbol_short!("claimed"),), (asset_id, round, holder, payout));
+        env.events().publish(
+            (symbol_short!("claimed"),),
+            (asset_id, round, holder, payout),
+        );
     }
 
     /// Close an offering (owner only).
