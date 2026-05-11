@@ -1,6 +1,7 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec,
 };
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -39,6 +40,7 @@ pub struct Listing {
     pub seller: Address,
     pub asset_id: u64,
     pub shares: i128,
+    pub tags: Vec<Symbol>,
     pub token: Address,
     pub price: i128,
     pub highest_bid: i128,
@@ -84,6 +86,7 @@ impl Marketplace {
         price: i128,
         listing_type: ListingType,
         deadline_ledger: u32,
+        tags: Vec<Symbol>,
     ) -> u64 {
         seller.require_auth();
         let id: u64 = env
@@ -95,6 +98,7 @@ impl Marketplace {
             seller: seller.clone(),
             asset_id,
             shares,
+            tags,
             token,
             price,
             highest_bid: 0,
@@ -112,6 +116,25 @@ impl Marketplace {
         env.events()
             .publish((symbol_short!("listed"),), (id, seller, asset_id, shares));
         id
+    }
+
+    /// Update the price on an active fixed-price listing.
+    pub fn update_price(env: Env, seller: Address, listing_id: u64, new_price: i128) {
+        seller.require_auth();
+        let mut listing = Self::load_listing(&env, listing_id);
+        assert!(listing.seller == seller, "not seller");
+        assert!(listing.status == ListingStatus::Active, "not active");
+        assert!(listing.listing_type == ListingType::FixedPrice, "not fixed price");
+
+        let old_price = listing.price;
+        listing.price = new_price;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Listing(listing_id), &listing);
+        env.events().publish(
+            (Symbol::new(&env, "price_updated"),),
+            (listing_id, old_price, new_price),
+        );
     }
 
     /// Buy a fixed-price listing immediately.
@@ -307,5 +330,215 @@ impl Marketplace {
             .persistent()
             .get(&DataKey::Listing(listing_id))
             .expect("listing not found")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Events, MockAuth, MockAuthInvoke},
+        IntoVal, TryIntoVal,
+    };
+
+    fn setup() -> (Env, Address) {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, Marketplace);
+        let client = MarketplaceClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &100u32);
+
+        (env, contract_id)
+    }
+
+    fn tags(env: &Env) -> Vec<Symbol> {
+        Vec::from_array(
+            env,
+            [Symbol::new(env, "real_estate"), Symbol::new(env, "income")],
+        )
+    }
+
+    fn create_listing_with_auth(
+        env: &Env,
+        contract_id: &Address,
+        client: &MarketplaceClient,
+        seller: &Address,
+        listing_type: ListingType,
+    ) -> u64 {
+        let token = Address::generate(env);
+        let listing_tags = tags(env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: seller,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "create_listing",
+                    args: (
+                        seller,
+                        42u64,
+                        100i128,
+                        token.clone(),
+                        1_000i128,
+                        listing_type.clone(),
+                        100u32,
+                        listing_tags.clone(),
+                    )
+                        .into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .create_listing(
+                seller,
+                &42u64,
+                &100i128,
+                &token,
+                &1_000i128,
+                &listing_type,
+                &100u32,
+                &listing_tags,
+            )
+    }
+
+    fn update_price_with_auth(
+        env: &Env,
+        contract_id: &Address,
+        client: &MarketplaceClient,
+        seller: &Address,
+        listing_id: u64,
+        new_price: i128,
+    ) {
+        client
+            .mock_auths(&[MockAuth {
+                address: seller,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "update_price",
+                    args: (seller, listing_id, new_price).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .update_price(seller, &listing_id, &new_price);
+    }
+
+    fn cancel_listing_with_auth(
+        env: &Env,
+        contract_id: &Address,
+        client: &MarketplaceClient,
+        seller: &Address,
+        listing_id: u64,
+    ) {
+        client
+            .mock_auths(&[MockAuth {
+                address: seller,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "cancel_listing",
+                    args: (listing_id,).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .cancel_listing(&listing_id);
+    }
+
+    #[test]
+    fn create_listing_stores_tags() {
+        let (env, contract_id) = setup();
+        let client = MarketplaceClient::new(&env, &contract_id);
+        let seller = Address::generate(&env);
+
+        let listing_id = create_listing_with_auth(
+            &env,
+            &contract_id,
+            &client,
+            &seller,
+            ListingType::FixedPrice,
+        );
+
+        let listing = client.get_listing(&listing_id);
+        assert!(listing.tags.len() == 2);
+        assert!(listing.tags.get(0).unwrap() == Symbol::new(&env, "real_estate"));
+        assert!(listing.tags.get(1).unwrap() == Symbol::new(&env, "income"));
+    }
+
+    #[test]
+    fn update_price_changes_active_fixed_price_listing() {
+        let (env, contract_id) = setup();
+        let client = MarketplaceClient::new(&env, &contract_id);
+        let seller = Address::generate(&env);
+        let listing_id = create_listing_with_auth(
+            &env,
+            &contract_id,
+            &client,
+            &seller,
+            ListingType::FixedPrice,
+        );
+
+        update_price_with_auth(&env, &contract_id, &client, &seller, listing_id, 2_500i128);
+
+        let listing = client.get_listing(&listing_id);
+        assert!(listing.price == 2_500i128);
+
+        let events = env.events().all();
+        let (_contract, topics, data) = events.get(events.len() - 1).unwrap();
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        let event_data: (u64, i128, i128) = data.try_into_val(&env).unwrap();
+        assert!(topic == Symbol::new(&env, "price_updated"));
+        assert!(event_data == (listing_id, 1_000i128, 2_500i128));
+    }
+
+    #[test]
+    #[should_panic]
+    fn update_price_rejects_unauthorized_caller() {
+        let (env, contract_id) = setup();
+        let client = MarketplaceClient::new(&env, &contract_id);
+        let seller = Address::generate(&env);
+        let not_seller = Address::generate(&env);
+        let listing_id = create_listing_with_auth(
+            &env,
+            &contract_id,
+            &client,
+            &seller,
+            ListingType::FixedPrice,
+        );
+
+        update_price_with_auth(
+            &env,
+            &contract_id,
+            &client,
+            &not_seller,
+            listing_id,
+            2_500i128,
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn update_price_rejects_auction_listing() {
+        let (env, contract_id) = setup();
+        let client = MarketplaceClient::new(&env, &contract_id);
+        let seller = Address::generate(&env);
+        let listing_id =
+            create_listing_with_auth(&env, &contract_id, &client, &seller, ListingType::Auction);
+
+        update_price_with_auth(&env, &contract_id, &client, &seller, listing_id, 2_500i128);
+    }
+
+    #[test]
+    #[should_panic]
+    fn update_price_rejects_inactive_listing() {
+        let (env, contract_id) = setup();
+        let client = MarketplaceClient::new(&env, &contract_id);
+        let seller = Address::generate(&env);
+        let listing_id = create_listing_with_auth(
+            &env,
+            &contract_id,
+            &client,
+            &seller,
+            ListingType::FixedPrice,
+        );
+
+        cancel_listing_with_auth(&env, &contract_id, &client, &seller, listing_id);
+        update_price_with_auth(&env, &contract_id, &client, &seller, listing_id, 2_500i128);
     }
 }
