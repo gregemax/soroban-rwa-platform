@@ -28,11 +28,11 @@ A production-ready **Real-World Asset (RWA) tokenization and trading protocol** 
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Add WASM target
-rustup target add wasm32-unknown-unknown
+# Add Stellar-compatible WASM target
+rustup target add wasm32v1-none
 
 # Install Stellar CLI
-cargo install --locked stellar-cli --features opt
+cargo install --locked stellar-cli
 ```
 
 ### Clone & Build
@@ -45,7 +45,7 @@ cd soroban-rwa-platform
 cargo build
 
 # Build WASM (for deployment)
-cargo build --target wasm32-unknown-unknown --release
+cargo build --target wasm32v1-none --release
 
 # Run tests
 cargo test
