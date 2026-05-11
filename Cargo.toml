@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "contracts/asset_registry",
+    "contracts/fractional",
+    "contracts/marketplace",
+]
+
+[workspace.dependencies]
+soroban-sdk = "21.0.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+codegen-units = 1
