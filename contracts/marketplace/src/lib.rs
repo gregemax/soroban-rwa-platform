@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Env,
 };
@@ -307,5 +308,523 @@ impl Marketplace {
             .persistent()
             .get(&DataKey::Listing(listing_id))
             .expect("listing not found")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
+        token, IntoVal, Symbol, TryIntoVal,
+    };
+
+    const ASSET_ID: u64 = 42;
+    const SHARES: i128 = 100;
+    const PRICE: i128 = 1_000;
+    const FIRST_BID: i128 = 700;
+    const SECOND_BID: i128 = 900;
+    const DEADLINE_LEDGER: u32 = 50;
+    const FEE_RATE_BPS: u32 = 100;
+
+    struct Setup {
+        env: Env,
+        contract_id: Address,
+        admin: Address,
+        token: Address,
+    }
+
+    fn client(setup: &Setup) -> MarketplaceClient<'_> {
+        MarketplaceClient::new(&setup.env, &setup.contract_id)
+    }
+
+    fn setup() -> Setup {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_sequence_number(10);
+        let contract_id = env.register_contract(None, Marketplace);
+        let client = MarketplaceClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        client.initialize(&admin, &FEE_RATE_BPS);
+
+        Setup {
+            env,
+            contract_id,
+            admin,
+            token,
+        }
+    }
+
+    fn setup_without_mock_all_auths() -> Setup {
+        let env = Env::default();
+        env.ledger().set_sequence_number(10);
+        let contract_id = env.register_contract(None, Marketplace);
+        let client = MarketplaceClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        client.initialize(&admin, &FEE_RATE_BPS);
+
+        Setup {
+            env,
+            contract_id,
+            admin,
+            token,
+        }
+    }
+
+    fn token_client<'a>(env: &'a Env, token: &'a Address) -> token::Client<'a> {
+        token::Client::new(env, token)
+    }
+
+    fn asset_client<'a>(env: &'a Env, token: &'a Address) -> token::StellarAssetClient<'a> {
+        token::StellarAssetClient::new(env, token)
+    }
+
+    fn create_listing(
+        setup: &Setup,
+        seller: &Address,
+        listing_type: ListingType,
+        price: i128,
+        deadline_ledger: u32,
+    ) -> u64 {
+        client(setup).create_listing(
+            seller,
+            &ASSET_ID,
+            &SHARES,
+            &setup.token,
+            &price,
+            &listing_type,
+            &deadline_ledger,
+        )
+    }
+
+    fn create_listing_with_seller_auth(
+        setup: &Setup,
+        seller: &Address,
+        listing_type: ListingType,
+    ) -> u64 {
+        client(setup)
+            .mock_auths(&[MockAuth {
+                address: seller,
+                invoke: &MockAuthInvoke {
+                    contract: &setup.contract_id,
+                    fn_name: "create_listing",
+                    args: (
+                        seller,
+                        ASSET_ID,
+                        SHARES,
+                        setup.token.clone(),
+                        PRICE,
+                        listing_type.clone(),
+                        DEADLINE_LEDGER,
+                    )
+                        .into_val(&setup.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .create_listing(
+                seller,
+                &ASSET_ID,
+                &SHARES,
+                &setup.token,
+                &PRICE,
+                &listing_type,
+                &DEADLINE_LEDGER,
+            )
+    }
+
+    fn cancel_listing_with_auth(setup: &Setup, signer: &Address, listing_id: u64) {
+        client(setup)
+            .mock_auths(&[MockAuth {
+                address: signer,
+                invoke: &MockAuthInvoke {
+                    contract: &setup.contract_id,
+                    fn_name: "cancel_listing",
+                    args: (listing_id,).into_val(&setup.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .cancel_listing(&listing_id);
+    }
+
+    #[test]
+    fn initialize_stores_admin_fee_rate_and_count() {
+        let setup = setup();
+        let stored: (Address, u32, u64) = setup.env.as_contract(&setup.contract_id, || {
+            let admin: Address = setup.env.storage().instance().get(&DataKey::Admin).unwrap();
+            let fee_rate: u32 = setup
+                .env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeRate)
+                .unwrap();
+            let listing_count: u64 = setup
+                .env
+                .storage()
+                .instance()
+                .get(&DataKey::ListingCount)
+                .unwrap();
+            (admin, fee_rate, listing_count)
+        });
+
+        assert!(stored.0 == setup.admin);
+        assert!(stored.1 == FEE_RATE_BPS);
+        assert!(stored.2 == 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn initialize_rejects_double_init() {
+        let setup = setup();
+        let other_admin = Address::generate(&setup.env);
+
+        client(&setup).initialize(&other_admin, &0u32);
+    }
+
+    #[test]
+    fn create_listing_stores_fixed_price_listing_and_event() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+
+        let listing_id = create_listing(
+            &setup,
+            &seller,
+            ListingType::FixedPrice,
+            PRICE,
+            DEADLINE_LEDGER,
+        );
+
+        let listing = client(&setup).get_listing(&listing_id);
+        assert!(listing.seller == seller);
+        assert!(listing.asset_id == ASSET_ID);
+        assert!(listing.shares == SHARES);
+        assert!(listing.token == setup.token);
+        assert!(listing.price == PRICE);
+        assert!(listing.highest_bid == 0);
+        assert!(listing.highest_bidder.is_none());
+        assert!(listing.listing_type == ListingType::FixedPrice);
+        assert!(listing.status == ListingStatus::Active);
+        assert!(listing.deadline_ledger == DEADLINE_LEDGER);
+
+        let events = setup.env.events().all();
+        let (_contract, topics, data) = events.get(events.len() - 1).unwrap();
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&setup.env).unwrap();
+        let event_data: (u64, Address, u64, i128) = data.try_into_val(&setup.env).unwrap();
+        assert!(topic == symbol_short!("listed"));
+        assert!(event_data == (listing_id, seller, ASSET_ID, SHARES));
+    }
+
+    #[test]
+    fn create_listing_stores_auction_listing() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+
+        let listing_id = create_listing(
+            &setup,
+            &seller,
+            ListingType::Auction,
+            FIRST_BID,
+            DEADLINE_LEDGER,
+        );
+
+        let listing = client(&setup).get_listing(&listing_id);
+        assert!(listing.seller == seller);
+        assert!(listing.price == FIRST_BID);
+        assert!(listing.listing_type == ListingType::Auction);
+        assert!(listing.status == ListingStatus::Active);
+    }
+
+    #[test]
+    fn buy_now_transfers_tokens_with_fee_and_marks_sold() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let buyer = Address::generate(&setup.env);
+        asset_client(&setup.env, &setup.token).mint(&buyer, &2_000i128);
+        let listing_id = create_listing(
+            &setup,
+            &seller,
+            ListingType::FixedPrice,
+            PRICE,
+            DEADLINE_LEDGER,
+        );
+
+        client(&setup).buy_now(&buyer, &listing_id);
+
+        let fee = PRICE * FEE_RATE_BPS as i128 / 10_000;
+        assert!(fee == 10i128);
+        assert!(token_client(&setup.env, &setup.token).balance(&seller) == PRICE - fee);
+        assert!(token_client(&setup.env, &setup.token).balance(&setup.admin) == fee);
+        assert!(client(&setup).get_listing(&listing_id).status == ListingStatus::Sold);
+    }
+
+    #[test]
+    #[should_panic]
+    fn buy_now_rejects_auction_listing() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let buyer = Address::generate(&setup.env);
+        asset_client(&setup.env, &setup.token).mint(&buyer, &2_000i128);
+        let listing_id = create_listing(
+            &setup,
+            &seller,
+            ListingType::Auction,
+            PRICE,
+            DEADLINE_LEDGER,
+        );
+
+        client(&setup).buy_now(&buyer, &listing_id);
+    }
+
+    #[test]
+    #[should_panic]
+    fn buy_now_rejects_expired_listing() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let buyer = Address::generate(&setup.env);
+        asset_client(&setup.env, &setup.token).mint(&buyer, &2_000i128);
+        let listing_id = create_listing(
+            &setup,
+            &seller,
+            ListingType::FixedPrice,
+            PRICE,
+            DEADLINE_LEDGER,
+        );
+        setup.env.ledger().set_sequence_number(DEADLINE_LEDGER + 1);
+
+        client(&setup).buy_now(&buyer, &listing_id);
+    }
+
+    #[test]
+    fn place_bid_locks_bid_and_records_offer() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let bidder = Address::generate(&setup.env);
+        asset_client(&setup.env, &setup.token).mint(&bidder, &1_000i128);
+        let listing_id = create_listing(
+            &setup,
+            &seller,
+            ListingType::Auction,
+            FIRST_BID,
+            DEADLINE_LEDGER,
+        );
+
+        client(&setup).place_bid(&bidder, &listing_id, &FIRST_BID);
+
+        let listing = client(&setup).get_listing(&listing_id);
+        assert!(listing.highest_bid == FIRST_BID);
+        assert!(listing.highest_bidder == Some(bidder.clone()));
+        assert!(token_client(&setup.env, &setup.token).balance(&setup.contract_id) == FIRST_BID);
+
+        let offer = client(&setup).get_offer(&listing_id, &0u64);
+        assert!(offer.listing_id == listing_id);
+        assert!(offer.bidder == bidder);
+        assert!(offer.amount == FIRST_BID);
+        assert!(offer.active);
+        assert!(offer.ledger == 10);
+    }
+
+    #[test]
+    fn place_bid_refunds_previous_highest_bidder() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let first_bidder = Address::generate(&setup.env);
+        let second_bidder = Address::generate(&setup.env);
+        asset_client(&setup.env, &setup.token).mint(&first_bidder, &FIRST_BID);
+        asset_client(&setup.env, &setup.token).mint(&second_bidder, &SECOND_BID);
+        let listing_id = create_listing(
+            &setup,
+            &seller,
+            ListingType::Auction,
+            FIRST_BID,
+            DEADLINE_LEDGER,
+        );
+
+        client(&setup).place_bid(&first_bidder, &listing_id, &FIRST_BID);
+        client(&setup).place_bid(&second_bidder, &listing_id, &SECOND_BID);
+
+        let listing = client(&setup).get_listing(&listing_id);
+        assert!(listing.highest_bid == SECOND_BID);
+        assert!(listing.highest_bidder == Some(second_bidder.clone()));
+        assert!(token_client(&setup.env, &setup.token).balance(&first_bidder) == FIRST_BID);
+        assert!(token_client(&setup.env, &setup.token).balance(&setup.contract_id) == SECOND_BID);
+    }
+
+    #[test]
+    #[should_panic]
+    fn place_bid_rejects_fixed_price_listing() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let bidder = Address::generate(&setup.env);
+        asset_client(&setup.env, &setup.token).mint(&bidder, &1_000i128);
+        let listing_id = create_listing(
+            &setup,
+            &seller,
+            ListingType::FixedPrice,
+            PRICE,
+            DEADLINE_LEDGER,
+        );
+
+        client(&setup).place_bid(&bidder, &listing_id, &FIRST_BID);
+    }
+
+    #[test]
+    #[should_panic]
+    fn place_bid_rejects_low_bid() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let first_bidder = Address::generate(&setup.env);
+        let second_bidder = Address::generate(&setup.env);
+        asset_client(&setup.env, &setup.token).mint(&first_bidder, &FIRST_BID);
+        asset_client(&setup.env, &setup.token).mint(&second_bidder, &FIRST_BID);
+        let listing_id = create_listing(
+            &setup,
+            &seller,
+            ListingType::Auction,
+            FIRST_BID,
+            DEADLINE_LEDGER,
+        );
+
+        client(&setup).place_bid(&first_bidder, &listing_id, &FIRST_BID);
+        client(&setup).place_bid(&second_bidder, &listing_id, &FIRST_BID);
+    }
+
+    #[test]
+    #[should_panic]
+    fn place_bid_rejects_after_deadline() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let bidder = Address::generate(&setup.env);
+        asset_client(&setup.env, &setup.token).mint(&bidder, &1_000i128);
+        let listing_id = create_listing(
+            &setup,
+            &seller,
+            ListingType::Auction,
+            FIRST_BID,
+            DEADLINE_LEDGER,
+        );
+        setup.env.ledger().set_sequence_number(DEADLINE_LEDGER + 1);
+
+        client(&setup).place_bid(&bidder, &listing_id, &FIRST_BID);
+    }
+
+    #[test]
+    fn settle_auction_pays_seller_fee_and_marks_sold() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let bidder = Address::generate(&setup.env);
+        asset_client(&setup.env, &setup.token).mint(&bidder, &1_000i128);
+        let listing_id = create_listing(
+            &setup,
+            &seller,
+            ListingType::Auction,
+            FIRST_BID,
+            DEADLINE_LEDGER,
+        );
+        client(&setup).place_bid(&bidder, &listing_id, &FIRST_BID);
+        setup.env.ledger().set_sequence_number(DEADLINE_LEDGER + 1);
+
+        client(&setup).settle_auction(&listing_id);
+
+        let fee = FIRST_BID * FEE_RATE_BPS as i128 / 10_000;
+        assert!(fee == 7i128);
+        assert!(token_client(&setup.env, &setup.token).balance(&seller) == FIRST_BID - fee);
+        assert!(token_client(&setup.env, &setup.token).balance(&setup.admin) == fee);
+        assert!(token_client(&setup.env, &setup.token).balance(&setup.contract_id) == 0);
+        assert!(client(&setup).get_listing(&listing_id).status == ListingStatus::Sold);
+    }
+
+    #[test]
+    fn settle_auction_without_bids_expires_listing() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let listing_id = create_listing(
+            &setup,
+            &seller,
+            ListingType::Auction,
+            FIRST_BID,
+            DEADLINE_LEDGER,
+        );
+        setup.env.ledger().set_sequence_number(DEADLINE_LEDGER + 1);
+
+        client(&setup).settle_auction(&listing_id);
+
+        assert!(client(&setup).get_listing(&listing_id).status == ListingStatus::Expired);
+    }
+
+    #[test]
+    #[should_panic]
+    fn settle_auction_rejects_before_deadline() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let bidder = Address::generate(&setup.env);
+        asset_client(&setup.env, &setup.token).mint(&bidder, &1_000i128);
+        let listing_id = create_listing(
+            &setup,
+            &seller,
+            ListingType::Auction,
+            FIRST_BID,
+            DEADLINE_LEDGER,
+        );
+        client(&setup).place_bid(&bidder, &listing_id, &FIRST_BID);
+
+        client(&setup).settle_auction(&listing_id);
+    }
+
+    #[test]
+    fn cancel_listing_refunds_highest_bidder_and_marks_cancelled() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let bidder = Address::generate(&setup.env);
+        asset_client(&setup.env, &setup.token).mint(&bidder, &1_000i128);
+        let listing_id = create_listing(
+            &setup,
+            &seller,
+            ListingType::Auction,
+            FIRST_BID,
+            DEADLINE_LEDGER,
+        );
+        client(&setup).place_bid(&bidder, &listing_id, &FIRST_BID);
+
+        client(&setup).cancel_listing(&listing_id);
+
+        assert!(token_client(&setup.env, &setup.token).balance(&bidder) == 1_000i128);
+        assert!(token_client(&setup.env, &setup.token).balance(&setup.contract_id) == 0);
+        assert!(client(&setup).get_listing(&listing_id).status == ListingStatus::Cancelled);
+    }
+
+    #[test]
+    #[should_panic]
+    fn cancel_listing_requires_seller_auth() {
+        let setup = setup_without_mock_all_auths();
+        let seller = Address::generate(&setup.env);
+        let other = Address::generate(&setup.env);
+        let listing_id = create_listing_with_seller_auth(&setup, &seller, ListingType::FixedPrice);
+
+        cancel_listing_with_auth(&setup, &other, listing_id);
+    }
+
+    #[test]
+    fn expire_listing_marks_fixed_price_expired_after_deadline() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let listing_id = create_listing(
+            &setup,
+            &seller,
+            ListingType::FixedPrice,
+            PRICE,
+            DEADLINE_LEDGER,
+        );
+        setup.env.ledger().set_sequence_number(DEADLINE_LEDGER + 1);
+
+        client(&setup).expire_listing(&listing_id);
+
+        assert!(client(&setup).get_listing(&listing_id).status == ListingStatus::Expired);
     }
 }
