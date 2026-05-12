@@ -1,6 +1,7 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String,
+    contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol,
 };
 
 // ── Storage keys ────────────────────────────────────────────────────────────
@@ -124,7 +125,7 @@ impl AssetRegistry {
             .instance()
             .set(&DataKey::AssetCount, &(id + 1));
         env.events()
-            .publish((symbol_short!("registered"),), (id, owner));
+            .publish((Symbol::new(&env, "registered"),), (id, owner));
         id
     }
 

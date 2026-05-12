@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Env,
 };
@@ -41,6 +42,8 @@ pub struct Listing {
     pub shares: i128,
     pub token: Address,
     pub price: i128,
+    pub reserve_price: i128,
+    pub min_bid_increment: i128,
     pub highest_bid: i128,
     pub highest_bidder: Option<Address>,
     pub listing_type: ListingType,
@@ -82,6 +85,8 @@ impl Marketplace {
         shares: i128,
         token: Address,
         price: i128,
+        reserve_price: i128,
+        min_bid_increment: i128,
         listing_type: ListingType,
         deadline_ledger: u32,
     ) -> u64 {
@@ -97,6 +102,8 @@ impl Marketplace {
             shares,
             token,
             price,
+            reserve_price,
+            min_bid_increment,
             highest_bid: 0,
             highest_bidder: None,
             listing_type,
@@ -158,7 +165,14 @@ impl Marketplace {
             env.ledger().sequence() <= listing.deadline_ledger,
             "auction ended"
         );
-        assert!(amount > listing.highest_bid, "bid too low");
+        if listing.min_bid_increment > 0 {
+            assert!(
+                amount >= listing.highest_bid + listing.min_bid_increment,
+                "bid increment too low"
+            );
+        } else {
+            assert!(amount > listing.highest_bid, "bid too low");
+        }
 
         let tok = token::Client::new(&env, &listing.token);
 
@@ -216,6 +230,19 @@ impl Marketplace {
         );
 
         if let Some(ref winner) = listing.highest_bidder.clone() {
+            let tok = token::Client::new(&env, &listing.token);
+
+            if listing.reserve_price > 0 && listing.highest_bid < listing.reserve_price {
+                tok.transfer(&env.current_contract_address(), winner, &listing.highest_bid);
+                listing.status = ListingStatus::Expired;
+                env.events()
+                    .publish((symbol_short!("expired"),), (listing_id,));
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Listing(listing_id), &listing);
+                return;
+            }
+
             let fee_rate: u32 = env
                 .storage()
                 .instance()
@@ -224,7 +251,6 @@ impl Marketplace {
             let fee = listing.highest_bid * fee_rate as i128 / 10_000;
             let seller_amount = listing.highest_bid - fee;
 
-            let tok = token::Client::new(&env, &listing.token);
             tok.transfer(&env.current_contract_address(), &listing.seller, &seller_amount);
             if fee > 0 {
                 let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -307,5 +333,168 @@ impl Marketplace {
             .persistent()
             .get(&DataKey::Listing(listing_id))
             .expect("listing not found")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token,
+    };
+
+    const ASSET_ID: u64 = 42;
+    const SHARES: i128 = 100;
+    const PRICE: i128 = 1_000;
+    const FIRST_BID: i128 = 700;
+    const SECOND_BID: i128 = 900;
+    const DEADLINE_LEDGER: u32 = 50;
+    const FEE_RATE_BPS: u32 = 100;
+
+    struct Setup {
+        env: Env,
+        contract_id: Address,
+        admin: Address,
+        token: Address,
+    }
+
+    fn client(setup: &Setup) -> MarketplaceClient<'_> {
+        MarketplaceClient::new(&setup.env, &setup.contract_id)
+    }
+
+    fn setup() -> Setup {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_sequence_number(10);
+        let contract_id = env.register_contract(None, Marketplace);
+        let client = MarketplaceClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        client.initialize(&admin, &FEE_RATE_BPS);
+
+        Setup {
+            env,
+            contract_id,
+            admin,
+            token,
+        }
+    }
+
+    fn token_client<'a>(env: &'a Env, token: &'a Address) -> token::Client<'a> {
+        token::Client::new(env, token)
+    }
+
+    fn asset_client<'a>(env: &'a Env, token: &'a Address) -> token::StellarAssetClient<'a> {
+        token::StellarAssetClient::new(env, token)
+    }
+
+    fn create_auction(
+        setup: &Setup,
+        seller: &Address,
+        reserve_price: i128,
+        min_bid_increment: i128,
+    ) -> u64 {
+        client(setup).create_listing(
+            seller,
+            &ASSET_ID,
+            &SHARES,
+            &setup.token,
+            &PRICE,
+            &reserve_price,
+            &min_bid_increment,
+            &ListingType::Auction,
+            &DEADLINE_LEDGER,
+        )
+    }
+
+    #[test]
+    fn create_listing_stores_reserve_and_increment() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+
+        let listing_id = create_auction(&setup, &seller, 800i128, 100i128);
+
+        let listing = client(&setup).get_listing(&listing_id);
+        assert!(listing.reserve_price == 800i128);
+        assert!(listing.min_bid_increment == 100i128);
+        assert!(listing.listing_type == ListingType::Auction);
+    }
+
+    #[test]
+    #[should_panic]
+    fn place_bid_enforces_minimum_increment() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let first_bidder = Address::generate(&setup.env);
+        let second_bidder = Address::generate(&setup.env);
+        asset_client(&setup.env, &setup.token).mint(&first_bidder, &FIRST_BID);
+        asset_client(&setup.env, &setup.token).mint(&second_bidder, &800i128);
+        let listing_id = create_auction(&setup, &seller, 0i128, 100i128);
+
+        client(&setup).place_bid(&first_bidder, &listing_id, &FIRST_BID);
+        client(&setup).place_bid(&second_bidder, &listing_id, &750i128);
+    }
+
+    #[test]
+    fn reserve_not_met_refunds_bidder_and_expires() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let bidder = Address::generate(&setup.env);
+        asset_client(&setup.env, &setup.token).mint(&bidder, &FIRST_BID);
+        let listing_id = create_auction(&setup, &seller, PRICE, 0i128);
+
+        client(&setup).place_bid(&bidder, &listing_id, &FIRST_BID);
+        setup.env.ledger().set_sequence_number(DEADLINE_LEDGER + 1);
+        client(&setup).settle_auction(&listing_id);
+
+        assert!(client(&setup).get_listing(&listing_id).status == ListingStatus::Expired);
+        assert!(token_client(&setup.env, &setup.token).balance(&bidder) == FIRST_BID);
+        assert!(token_client(&setup.env, &setup.token).balance(&setup.contract_id) == 0);
+        assert!(token_client(&setup.env, &setup.token).balance(&seller) == 0);
+        assert!(token_client(&setup.env, &setup.token).balance(&setup.admin) == 0);
+    }
+
+    #[test]
+    fn reserve_and_increment_auction_settles_normally() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let first_bidder = Address::generate(&setup.env);
+        let second_bidder = Address::generate(&setup.env);
+        asset_client(&setup.env, &setup.token).mint(&first_bidder, &FIRST_BID);
+        asset_client(&setup.env, &setup.token).mint(&second_bidder, &SECOND_BID);
+        let listing_id = create_auction(&setup, &seller, 800i128, 100i128);
+
+        client(&setup).place_bid(&first_bidder, &listing_id, &FIRST_BID);
+        client(&setup).place_bid(&second_bidder, &listing_id, &SECOND_BID);
+        setup.env.ledger().set_sequence_number(DEADLINE_LEDGER + 1);
+        client(&setup).settle_auction(&listing_id);
+
+        let fee = SECOND_BID * FEE_RATE_BPS as i128 / 10_000;
+        assert!(client(&setup).get_listing(&listing_id).status == ListingStatus::Sold);
+        assert!(token_client(&setup.env, &setup.token).balance(&first_bidder) == FIRST_BID);
+        assert!(token_client(&setup.env, &setup.token).balance(&seller) == SECOND_BID - fee);
+        assert!(token_client(&setup.env, &setup.token).balance(&setup.admin) == fee);
+        assert!(token_client(&setup.env, &setup.token).balance(&setup.contract_id) == 0);
+    }
+
+    #[test]
+    fn zero_reserve_and_increment_preserves_existing_auction_flow() {
+        let setup = setup();
+        let seller = Address::generate(&setup.env);
+        let bidder = Address::generate(&setup.env);
+        asset_client(&setup.env, &setup.token).mint(&bidder, &FIRST_BID);
+        let listing_id = create_auction(&setup, &seller, 0i128, 0i128);
+
+        client(&setup).place_bid(&bidder, &listing_id, &FIRST_BID);
+        setup.env.ledger().set_sequence_number(DEADLINE_LEDGER + 1);
+        client(&setup).settle_auction(&listing_id);
+
+        let fee = FIRST_BID * FEE_RATE_BPS as i128 / 10_000;
+        assert!(client(&setup).get_listing(&listing_id).status == ListingStatus::Sold);
+        assert!(token_client(&setup.env, &setup.token).balance(&seller) == FIRST_BID - fee);
+        assert!(token_client(&setup.env, &setup.token).balance(&setup.admin) == fee);
+        assert!(token_client(&setup.env, &setup.token).balance(&setup.contract_id) == 0);
     }
 }
