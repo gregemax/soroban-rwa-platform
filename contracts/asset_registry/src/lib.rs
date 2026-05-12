@@ -1,6 +1,7 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String,
+    contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol,
 };
 
 // ── Storage keys ────────────────────────────────────────────────────────────
@@ -124,7 +125,7 @@ impl AssetRegistry {
             .instance()
             .set(&DataKey::AssetCount, &(id + 1));
         env.events()
-            .publish((symbol_short!("registered"),), (id, owner));
+            .publish((Symbol::new(&env, "registered"),), (id, owner));
         id
     }
 
@@ -181,12 +182,7 @@ impl AssetRegistry {
             .publish((symbol_short!("unfrozen"),), (asset_id,));
     }
 
-    pub fn update_appraisal(
-        env: Env,
-        asset_id: u64,
-        new_value: i128,
-        currency: String,
-    ) {
+    pub fn update_appraisal(env: Env, asset_id: u64, new_value: i128, currency: String) {
         let mut asset = Self::load_asset(&env, asset_id);
         asset.owner.require_auth();
         asset.appraised_value = new_value;
@@ -205,8 +201,7 @@ impl AssetRegistry {
         let mut asset = Self::load_asset(&env, asset_id);
         asset.owner.require_auth();
         assert!(
-            asset.status == AssetStatus::Verified
-                || asset.status == AssetStatus::Rejected,
+            asset.status == AssetStatus::Verified || asset.status == AssetStatus::Rejected,
             "cannot retire"
         );
         asset.status = AssetStatus::Retired;

@@ -1,14 +1,13 @@
 #![no_std]
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env,
-};
+#![allow(clippy::too_many_arguments)]
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env};
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
 pub enum DataKey {
     Admin,
-    FeeRate,        // basis points
+    FeeRate, // basis points
     Listing(u64),
     ListingCount,
     Offer(u64, u64), // (listing_id, offer_index)
@@ -70,7 +69,9 @@ impl Marketplace {
             panic!("already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::FeeRate, &fee_rate_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeRate, &fee_rate_bps);
         env.storage().instance().set(&DataKey::ListingCount, &0u64);
     }
 
@@ -119,17 +120,16 @@ impl Marketplace {
         buyer.require_auth();
         let mut listing = Self::load_listing(&env, listing_id);
         assert!(listing.status == ListingStatus::Active, "not active");
-        assert!(listing.listing_type == ListingType::FixedPrice, "not fixed price");
+        assert!(
+            listing.listing_type == ListingType::FixedPrice,
+            "not fixed price"
+        );
         assert!(
             env.ledger().sequence() <= listing.deadline_ledger,
             "listing expired"
         );
 
-        let fee_rate: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeRate)
-            .unwrap_or(0);
+        let fee_rate: u32 = env.storage().instance().get(&DataKey::FeeRate).unwrap_or(0);
         let fee = listing.price * fee_rate as i128 / 10_000;
         let seller_amount = listing.price - fee;
 
@@ -216,16 +216,16 @@ impl Marketplace {
         );
 
         if let Some(ref winner) = listing.highest_bidder.clone() {
-            let fee_rate: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::FeeRate)
-                .unwrap_or(0);
+            let fee_rate: u32 = env.storage().instance().get(&DataKey::FeeRate).unwrap_or(0);
             let fee = listing.highest_bid * fee_rate as i128 / 10_000;
             let seller_amount = listing.highest_bid - fee;
 
             let tok = token::Client::new(&env, &listing.token);
-            tok.transfer(&env.current_contract_address(), &listing.seller, &seller_amount);
+            tok.transfer(
+                &env.current_contract_address(),
+                &listing.seller,
+                &seller_amount,
+            );
             if fee > 0 {
                 let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
                 tok.transfer(&env.current_contract_address(), &admin, &fee);
@@ -276,7 +276,10 @@ impl Marketplace {
     pub fn expire_listing(env: Env, listing_id: u64) {
         let mut listing = Self::load_listing(&env, listing_id);
         assert!(listing.status == ListingStatus::Active, "not active");
-        assert!(listing.listing_type == ListingType::FixedPrice, "not fixed price");
+        assert!(
+            listing.listing_type == ListingType::FixedPrice,
+            "not fixed price"
+        );
         assert!(
             env.ledger().sequence() > listing.deadline_ledger,
             "not expired yet"
